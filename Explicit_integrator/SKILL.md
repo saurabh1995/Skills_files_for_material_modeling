@@ -1,4 +1,5 @@
 ---
+## ⚠️ CRITICAL: Read CLAUDE.md First
 name: explicit-integration-scheme
 description: Generate explicit time integration schemes for viscoplastic constitutive models with damage. Use when users provide constitutive equations (stress-strain relations, damage evolution, hardening laws, flow rules) and need a JAX-compatible explicit integration algorithm in the style of Lemaitre-Chaboche or Perzyna viscoplasticity with elastic predictor-plastic corrector structure. Trigger when user asks to create explicit scheme, integration algorithm, or material model implementation from equations.
 ---
