@@ -1,0 +1,8 @@
+{
+  "name": "fenicsx-mechanics-suite",
+  "description": "Unified plugin containing explicit/implicit constitutive integration skills for FEniCSx.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Ameya"
+  }
+}
