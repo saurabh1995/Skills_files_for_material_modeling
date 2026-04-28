@@ -1,6 +1,67 @@
 # Complete Code Template for Explicit Integration Scheme
 
-This file provides a fully annotated template for implementing explicit integration schemes for viscoplastic constitutive models with damage.
+This file provides a fully annotated template for implementing explicit integration schemes for viscoplastic constitutive models.
+
+---
+
+## ⚠️ MANDATORY: The Corrected Two-Phase Explicit Sequence
+
+The plastic update branch MUST follow this exact two-phase structure. Any deviation produces physically wrong results.
+
+### Phase 1 — Advance state using OLD rates (already stored in `state`)
+At each step `i`, the state is advanced using rates that were computed and stored at the **end of step `i-1`**:
+
+```
+dlambda       = lambda_dot_old * dt
+delta_eps_p   = eps_p_dot_old  * dt
+eps_p_new     = eps_p_old + delta_eps_p
+eps_e_new     = eps_e_old + (deps - delta_eps_p)
+R_new         = R_old + R_dot_old * dt
+alpha_new     = alpha_old + alpha_dot_old * dt
+sig_new       = C @ (eps - eps_p_new)     ← computed from updated εp
+```
+
+### Phase 2 — Re-evaluate ALL rates at the NEW state
+After advancing, recompute the yield function and all rates at `(sig_new, R_new, alpha_new)`:
+
+```
+n_new          = dev(sig_new) - alpha_new
+sigma_eq_new   = sqrt(3/2 n_new:n_new)
+f_new          = sigma_eq_new - (sigma_y + R_new)
+lambda_dot_new = <f_new / eta>^n
+eps_p_dot_new  = lambda_dot_new * (3/2) * n_new / sigma_eq_new
+R_dot_new      = H * lambda_dot_new
+alpha_dot_new  = (2/3)*C1*eps_p_dot_new - gamma*alpha_new*lambda_dot_new
+```
+
+These rates are stored in `state` and become the "old rates" for the NEXT step.
+
+### WRONG pattern — never do this
+```python
+# WRONG: computing Δλ from fy_trial (trial yield function)
+overstress  = fy_trial / params.eta
+bracket     = 0.5 * (overstress + jnp.abs(overstress))
+dlambda     = dt * jnp.power(bracket, params.n_visc)   # ← WRONG
+delta_eps_p = 1.5 * dlambda * flow_dir_from_trial       # ← WRONG
+```
+
+### CORRECT pattern
+```python
+# CORRECT: advance using old rate, then re-evaluate
+dlambda       = lambda_dot_old * dt                     # ← Phase 1
+delta_eps_p   = eps_p_dot_old * dt                      # ← Phase 1
+eps_p_new     = eps_p_old + delta_eps_p
+sig_new       = C @ (eps - eps_p_new)
+# ... update R_new, alpha_new ...
+# Re-evaluate f at new state
+fy_new        = sigma_eq_new - (sigma_y + R_new)        # ← Phase 2
+x             = fy_new / params.eta
+bracket       = 0.5 * (x + jnp.abs(x))
+lambda_dot_new = jnp.power(bracket, params.n_visc)      # ← Phase 2
+eps_p_dot_new = lambda_dot_new * 1.5 * flow_dir_new     # ← Phase 2
+```
+
+---
 
 ## Full Implementation Template
 
@@ -14,466 +75,338 @@ from dolfinx_materials.material.jax import JAXMaterial, tangent_AD
 @dataclass
 class ModelParams:
     """
-    Material parameters for the constitutive model.
-    Customize based on the specific model equations provided.
+    Material parameters. Customize for the specific model equations.
     """
-    # Elastic properties
-    E: float       # Young's modulus [MPa]
-    nu: float      # Poisson's ratio [-]
+    # Elastic
+    E: float        # Young's modulus [MPa]
+    nu: float       # Poisson's ratio [-]
 
-    # Viscoplastic parameters (Perzyna-type)
-    k: float       # Initial yield stress [MPa]
-    K_visc: float  # Viscosity parameter [MPa·s^(1/n)]
-    n_visc: float  # Viscosity exponent [-]
+    # Yield
+    sigma_y: float  # Initial yield stress [MPa]
 
-    # Isotropic hardening (if applicable)
-    b: float       # Saturation rate [-]
-    R1: float      # Saturation value [MPa]
+    # Viscoplastic (Perzyna-type)
+    eta: float      # Viscosity parameter [MPa·s^(1/n)]
+    n_visc: float   # Viscosity exponent [-]
 
-    # Kinematic hardening (if applicable)
-    a: float       # Kinematic modulus [MPa]
-    c: float       # Dynamic recovery [-]
+    # Isotropic hardening
+    H: float        # Hardening modulus [MPa]
 
-    # Damage parameters (if applicable)
-    Dc: float      # Critical damage [-]
-    eps_R: float   # Critical plastic strain [-]
-    eps_D: float   # Damage threshold strain [-]
+    # Kinematic hardening (Armstrong-Frederick)
+    C1: float       # Kinematic modulus [MPa]
+    gamma1: float   # Dynamic recovery [-]
+
+    # Add further parameters as needed (C2, gamma2, Dc, eps_R, ...)
 
 
 class ConstitutiveMaterial(JAXMaterial):
     """
-    Explicit integration scheme 
-
+    Explicit integration scheme for viscoplastic constitutive model.
+    Uses the two-phase corrected explicit sequence:
+      Phase 1: advance state from old rates
+      Phase 2: re-evaluate rates at new state for next step
     """
-    
+
     def __init__(self, elastic_model, params: ModelParams):
         super().__init__()
         self.elastic_model = elastic_model
         self.params = params
-        self.dt = 0.0 
+        self.dt = 0.0
 
     @property
     def gradient_names(self):
-        """Input gradients - typically total strain"""
         return ("Strain",)
 
     @property
     def flux_names(self):
-        """Output fluxes - typically Cauchy stress"""
         return ("Stress",)
 
     @property
     def internal_state_variables(self):
         """
-        All history variables per integration point.
-        Each key maps to the dimension of that variable:
-        - Scalars: 1
-        - Voigt tensors (3D): 6
-        
-        CRITICAL: All variables used in constitutive_update must be declared here.
+        CRITICAL: Must declare ALL state variables AND all rate variables.
+        Rates are required so the next step can advance from them (Phase 1).
         """
         return {
-            # Primary internal variables
-            "p": 1,      # Equivalent plastic strain (scalar)
-            "D": 1,      # Damage variable (scalar, 0 to Dc)
-            "R": 1,      # Isotropic hardening (scalar)
-            "eps_p": 6,  # Plastic strain tensor (Voigt)
-            "X": 6,      # Backstress tensor (Voigt)
-            "eps_e": 6,  # Elastic strain tensor (Voigt)
-            
-            # Diagnostic/output variables
-            "fy": 1,         # Yield function value
-            "p_dot": 1,      # Plastic strain rate
-            "dp": 1,         # Plastic strain increment
-            "D_dot": 1,      # Damage rate
-            "R_dot": 1,      # Isotropic hardening rate
-            "X_dot": 6,      # Backstress rate (Voigt)
-            "eps_I_dot": 6,  # Inelastic strain rate (Voigt)
-            "is_plastic": 1  # Flag indicating plastic loading
+            # Integrated state
+            "eps_p":      6,   # Plastic strain tensor (Voigt)
+            "eps_e":      6,   # Elastic strain tensor (Voigt)
+            "R":          1,   # Isotropic hardening variable (scalar)
+            "alpha1":     6,   # Backstress tensor (Voigt)
+            # Add "alpha2": 6 for two-backstress models, etc.
+
+            # Rate variables — MANDATORY for Phase 1 of next step
+            "lambda_dot": 1,   # Viscoplastic multiplier rate
+            "dlambda":    1,   # Viscoplastic multiplier increment
+            "eps_p_dot":  6,   # Plastic strain rate (Voigt)
+            "R_dot":      1,   # Isotropic hardening rate
+            "alpha1_dot": 6,   # Backstress rate (Voigt)
+            # Add "alpha2_dot": 6 for two-backstress models, etc.
+
+            # Diagnostics
+            "fy":         1,   # Yield function value
+            "is_plastic": 1,   # Plastic loading flag
         }
 
     # ========================================================================
     # HELPER METHODS
     # ========================================================================
-    
+
     def _deviatoric(self, sig):
-        """
-        Extract deviatoric part of Voigt stress tensor.
-        
-        Input: sig = [s11, s22, s33, s12, s13, s23]
-        Output: sig_dev = sig - (1/3)*tr(sig)*I
-        """
+        """Deviatoric part: sig - (1/3) tr(sig) I  (Voigt notation)"""
         p = (sig[0] + sig[1] + sig[2]) / 3.0
         return jnp.array([
-            sig[0] - p,
-            sig[1] - p,
-            sig[2] - p,
-            sig[3],
-            sig[4],
-            sig[5],
+            sig[0] - p, sig[1] - p, sig[2] - p,
+            sig[3], sig[4], sig[5],
         ], dtype=sig.dtype)
-    
-    def _J2(self, sig_dev):
-        """
-        J2 invariant with numerical regularization.
-        
-        J2 = sqrt(3/2 * s_dev : s_dev)
-        
-        The regularization prevents gradient issues at s_dev = 0:
-        - Physical value: sqrt(max(1.5*s:s, 0))
-        - Gradient computed from: sqrt(1.5*s:s + eps_reg)
-        
-        This uses JAX's stop_gradient to achieve this behavior.
-        """
-        s = sig_dev
-        
-        # Compute s : s with Voigt convention (factor of 2 for shear terms)
-        s_colon_s = (
-            s[0] * s[0] +
-            s[1] * s[1] +
-            s[2] * s[2] +
-            2.0 * (s[3] * s[3] + s[4] * s[4] + s[5] * s[5])
+
+    def _norm_voigt(self, vec):
+        """Inner product in Voigt notation: v:v = v1²+v2²+v3²+2(v4²+v5²+v6²)"""
+        return (
+            vec[0]*vec[0] + vec[1]*vec[1] + vec[2]*vec[2]
+            + 2.0*(vec[3]*vec[3] + vec[4]*vec[4] + vec[5]*vec[5])
         )
-        
-        val = 1.5 * s_colon_s
+
+    def _equivalent_norm(self, vec):
+        """
+        Equivalent norm: sqrt(3/2 * vec:vec)
+        Regularized to avoid sqrt(0) in gradients.
+        """
+        val     = 1.5 * self._norm_voigt(vec)
         val_pos = jnp.maximum(val, 0.0)
-
-        # Physical value (what we actually want)
-        J2_phys = jnp.sqrt(val_pos)
-
-        # Regularized value (for gradient computation)
         eps_reg = 1e-16
-        J2_reg = jnp.sqrt(val_pos + eps_reg)
-
-        # Return physical value but with regularized gradient
-        return jax.lax.stop_gradient(J2_phys - J2_reg) + J2_reg
+        phys    = jnp.sqrt(val_pos)
+        reg     = jnp.sqrt(val_pos + eps_reg)
+        return jax.lax.stop_gradient(phys - reg) + reg
 
     def _hydrostatic(self, sig):
-        """Hydrostatic (mean normal) stress."""
         return (sig[0] + sig[1] + sig[2]) / 3.0
 
     def _equiv_stress(self, sig):
-        """Huber-Mises equivalent stress from total stress."""
-        sig_dev = self._deviatoric(sig)
-        return self._J2(sig_dev)
-    
+        return self._equivalent_norm(self._deviatoric(sig))
+
     # ========================================================================
     # MAIN CONSTITUTIVE UPDATE
     # ========================================================================
-    
+
     @tangent_AD
     def constitutive_update(self, eps, state, dt):
         """
-        Explicit integration scheme for one time step.
-        
-        Algorithm structure:
-        1. Extract old state 
-        2. Elastic predictor 
-        3. Check plasticity 
-        4. Elastic or plastic branch 
-        5. Update state variables 
-        
-        Args:
-            eps: Current total strain (6-component Voigt)
-            state: Dictionary of all state variables
-            dt: Time step size
-            
-        Returns:
-            sig_new: Updated stress
-            state: Updated state dictionary
+        Explicit integration for one time step.
+
+        Algorithm:
+          1. Extract old state AND old rates
+          2. Elastic predictor (trial stress from old εp)
+          3. Yield check on trial state
+          4. Elastic or plastic branch (jax.lax.cond)
+          5. Update state dictionary (state + rates)
         """
-        
-        # ====================================================================
-        # 1. EXTRACT OLD STATE VARIABLES 
-        # ====================================================================
-        
-        eps_old = state["Strain"]     # Total strain at t-1
-        deps = eps - eps_old          # Total strain increment
-        sig_old = state["Stress"]     # Stress at t-1
-
-        eps_p_old = state["eps_p"]    # Plastic strain at t-1 (Voigt)
-        eps_e_old = state["eps_e"]    # Elastic strain at t-1 (Voigt)
-        X_old = state["X"]            # Backstress at t-1 (Voigt)
-
-        p_old = state["p"][0]         # Equivalent plastic strain (scalar)
-        D_old = state["D"][0]         # Damage (scalar)
-        R_old = state["R"][0]         # Isotropic hardening (scalar)
-        
-        # Rates from previous step (used in plastic update initialization)
-        p_dot = state["p_dot"][0] 
-        eps_I_dot = state["eps_I_dot"]
-     
-        # ====================================================================
-        # 2. ELASTIC PREDICTOR 
-        # ====================================================================
-        
-        # Trial stress assuming purely elastic increment
-        C = self.elastic_model.C  # Elastic stiffness tensor 
-        sig_trial = sig_old + (1.0 - D_old) * (C @ deps)
-
-        # ====================================================================
-        # 3. YIELD FUNCTION EVALUATION 
-        # ====================================================================
-        
         params = self.params
-        
-        # Effective stress (accounting for backstress)
-        sig_eff = sig_trial - X_old
-        sig_eff_dev = self._deviatoric(sig_eff)
-        J2_eff = self._J2(sig_eff_dev)
-
-        # Correct for damage
-        denom_D = 1.0 - D_old 
-        sigma_eff = J2_eff / denom_D
-
-        # Yield function: f = sigma_eff - (R + k)
-        # f < 0: elastic, f >= 0: plastic
-        fy = sigma_eff - (R_old + params.k) ## this yield function will change according to user's query
+        C = self.elastic_model.C   # Always use this — never recompute
 
         # ====================================================================
-        # 4. PREPARE FOR ELASTIC/PLASTIC BRANCHING
+        # 1. EXTRACT OLD STATE AND OLD RATES
         # ====================================================================
-        
-        # Initialize variables that will be updated
-        D_dot = 0.0
-        R_dot = 0.0
-        X_dot = jnp.zeros((6,), dtype=eps.dtype)
-        R_new = 0.0
-        X_new = jnp.zeros((6,), dtype=eps.dtype)
+        eps_old        = state["Strain"]
+        deps           = eps - eps_old          # total strain increment
 
-        # Pack all variables into operand tuple for jax.lax.cond
-        # Both branches must accept the same operand signature
-        operand = (eps, eps_old, sig_old, eps_p_old, eps_e_old, X_old,
-                   p_old, D_old, R_old, deps, sig_trial, fy, dt, 
-                   p_dot, D_dot, R_dot, X_dot, eps_I_dot, R_new, X_new)
+        eps_p_old      = state["eps_p"]
+        eps_e_old      = state["eps_e"]
+        R_old          = state["R"][0]
+        alpha1_old     = state["alpha1"]
+        # Add: alpha2_old = state["alpha2"]  etc. for multi-backstress
+
+        # OLD RATES — used in Phase 1 of plastic update
+        lambda_dot_old  = state["lambda_dot"][0]
+        eps_p_dot_old   = state["eps_p_dot"]
+        R_dot_old       = state["R_dot"][0]
+        alpha1_dot_old  = state["alpha1_dot"]
+        # Add: alpha2_dot_old = state["alpha2_dot"]  etc.
 
         # ====================================================================
-        # 5. ELASTIC BRANCH (Algorithm 1, line 9-12)
+        # 2. ELASTIC PREDICTOR (trial stress using OLD plastic strain)
         # ====================================================================
-        
+        sig_trial = C @ (eps - eps_p_old)
+        # For damaged models: sig_trial = sig_old + (1.0 - D_old)*(C @ deps)
+
+        # ====================================================================
+        # 3. YIELD CHECK on trial state
+        # ====================================================================
+        sig_trial_dev   = self._deviatoric(sig_trial)
+        n_trial         = sig_trial_dev - alpha1_old   # subtract all backstresses
+        sigma_eq_trial  = self._equivalent_norm(n_trial)
+        fy_trial        = sigma_eq_trial - (params.sigma_y + R_old)
+
+        # ====================================================================
+        # 4. PACK OPERAND
+        # ====================================================================
+        operand = (
+            eps, eps_old, deps,
+            eps_p_old, eps_e_old, R_old, alpha1_old,
+            lambda_dot_old, eps_p_dot_old, R_dot_old, alpha1_dot_old,
+            sig_trial, n_trial, sigma_eq_trial, fy_trial,
+            dt,
+        )
+
+        # ====================================================================
+        # 5. ELASTIC BRANCH
+        # ====================================================================
         def _elastic_update(operand):
-            """
-            Elastic loading: no plastic deformation, no hardening evolution.
-            Simply use trial stress and update elastic strain.
-            """
-            (eps, eps_old, sig_old, eps_p_old, eps_e_old, X_old,
-             p_old, D_old, R_old, deps, sig_trial, fy, dt, 
-             p_dot, D_dot, R_dot, X_dot, eps_I_dot, R_new, X_new) = operand
-        
-            # Accept trial stress (no plastic correction needed)
-            sig_new = sig_trial
-            
-            # Backstress remains unchanged
-            X_new = X_old
+            (
+                eps, eps_old, deps,
+                eps_p_old, eps_e_old, R_old, alpha1_old,
+                lambda_dot_old, eps_p_dot_old, R_dot_old, alpha1_dot_old,
+                sig_trial, n_trial, sigma_eq_trial, fy_trial,
+                dt,
+            ) = operand
 
-            # All strain increment is elastic
-            eps_e_new = eps_e_old + deps
-            eps_p_new = eps_p_old  
-            eps = eps_e_new + eps_p_new
+            sig_new        = sig_trial
+            eps_p_new      = eps_p_old
+            eps_e_new      = eps - eps_p_new
+            R_new          = R_old
+            alpha1_new     = alpha1_old
 
-            # No evolution of plastic variables
-            p_new = p_old
-            D_new = D_old
-            R_new = R_old
-        
-            # All rates are zero
-            p_dot = 0.0
-            dp = 0.0
-            D_dot = 0.0
-            R_dot = 0.0
-            X_dot = jnp.zeros_like(X_new)
-            eps_I_dot = jnp.zeros((6,), dtype=eps.dtype)
+            # All rates are zero — no evolution in elastic zone
+            lambda_dot_new  = jnp.array(0.0, dtype=eps.dtype)
+            dlambda         = jnp.array(0.0, dtype=eps.dtype)
+            eps_p_dot_new   = jnp.zeros(6, dtype=eps.dtype)
+            R_dot_new       = jnp.array(0.0, dtype=eps.dtype)
+            alpha1_dot_new  = jnp.zeros(6, dtype=eps.dtype)
 
-            # Flag indicating no plastic deformation
-            is_plastic_out = jnp.array(0.0, dtype=eps.dtype)
+            is_plastic_out  = jnp.array(0.0, dtype=eps.dtype)
+            fy_out          = fy_trial
 
-            # Return all variables (must match plastic branch signature)
-            return (sig_new, eps_e_new, X_new, eps, eps_p_new, 
-                    p_new, D_new, R_new, fy, p_dot, dp, D_dot, 
-                    R_dot, X_dot, eps_I_dot, is_plastic_out)
-        
-        # ====================================================================
-        # 6. PLASTIC BRANCH (Algorithm 1, line 14-41)
-        # ====================================================================
-        
-        def _plastic_update(operand):
-            """
-            Plastic loading: compute plastic strain increment and evolve
-            all internal variables (hardening, damage).
-            """
-            (eps, eps_old, sig_old, eps_p_old, eps_e_old, X_old,
-             p_old, D_old, R_old, deps, sig_trial, fy, dt, 
-             p_dot, D_dot, R_dot, X_dot, eps_I_dot, R_new, X_new) = operand
-
-            # ================================================================
-            # 6a. Update P and damage
-            # ================================================================
-            
-            # Equivalent plastic strain increment
-            dp = p_dot * dt 
-            p_new = p_old + dp 
-
-            ## Update damage
-            D_new = D_old + D_dot * dt
-
-            # ================================================================
-            # 6b. UPDATE STRAINS
-            # ================================================================
-            # Inelastic strain increment
-            delta_eps_I = eps_I_dot * dt
-
-            # Total plastic strain
-            eps_p_new = eps_p_old + delta_eps_I
-            
-            # Elastic strain increment (total minus inelastic)
-            delta_eps_e = deps - delta_eps_I
-            eps_e_new = eps_e_old + delta_eps_e
-
-            # Total strain (should equal input eps)
-            eps = eps_e_new + eps_p_new
-
-            # ================================================================
-            # 6c. UPDATE STRESS
-            # ================================================================
-
-            # Stress update with evolving damage
-            sig_new = sig_old + (1.0 - D_new) * (C @ delta_eps_e)
-
-            # ================================================================
-            # 6d. UPDATE X and R
-            # ================================================================
-            
-            X_new = X_old + X_dot * dt
-            R_new = R_old + R_dot * dt
-
-       
-            # ================================================================
-            # 6e. COMPUTE P dot
-            # ================================================================
-            
-            sig_eff_1 = sig_new - X_new
-            sig_eff_dev_1 = self._deviatoric(sig_eff_1)
-            J2_eff_1 = self._J2(sig_eff_dev_1)
-
-            # Effective stress corrected for damage
-            denom_D = 1.0 - D_old 
-            sigma_eff_2 = J2_eff_1 / denom_D
-            fy_1 = sigma_eff_2 - (R_new + params.k)
-            x = fy_1 / params.K_visc
-            bracket = 0.5 * (x + jnp.abs(x))  
-
-            p_dot = jnp.power(bracket, params.n_visc)
-            
-            # ================================================================
-            # 6f. COMPUTE INELASTIC STRAIN INCREMENT (E_dot)
-            # ================================================================
-            sig_eff_p = sig_new - X_new
-            sig_eff_dev_p = self._deviatoric(sig_eff_p)
-            J2_eff_p = self._J2(sig_eff_dev_p)
-            
-            inv_J2 = jnp.where(J2_eff_p > 0.0, 1.0 / J2_eff_p, 0.0)
-
-            flow_dir = sig_eff_dev_p * inv_J2      # normalized direction
-            # Inelastic strain rate: eps_I_dot = (3/2) * p_dot * n
-            eps_I_dot = 1.5 * p_dot * flow_dir
-            
-            # ================================================================
-            # 6g. UPDATE HARDENING VARIABLES 
-            # ================================================================
-            
-            # Isotropic hardening rate: R_dot = b(R1 - R) * p_dot
-            R_dot = params.b * (params.R1 - R_new) * p_dot
-         
-            
-            # Kinematic hardening rate: X_dot = (2/3)*a*eps_I_dot - c*X*p_dot
-            X_dot = (2.0 / 3.0) * params.a * eps_I_dot - params.c * X_new * p_dot
-    
-
-            # ================================================================
-            # 6h. UPDATE Damage parameters
-            # ================================================================
-            # For models WITHOUT damage evolution during the step:
-            # sig_new = sig_old + (1.0 - D_old) * C @ (deps - delta_eps_I)
-            
-            # For models WITH damage evolution:
-            # First compute damage rate and new damage
-            
-            # Damage rate (Lemaitre damage)
-            sigma_eq = self._equiv_stress(sig_new)  # Using trial stress
-            sigma_H = self._hydrostatic(sig_new)
-
-            nu = params.nu
-            bracket_damage = (
-                (2.0 / 3.0) * (1.0 + nu) * sigma_eq * sigma_eq +
-                3.0 * (1.0 - 2.0 * nu) * sigma_H * sigma_H
+            return (
+                sig_new, eps_p_new, eps_e_new, R_new, alpha1_new,
+                lambda_dot_new, dlambda, eps_p_dot_new, R_dot_new, alpha1_dot_new,
+                fy_out, is_plastic_out,
             )
 
-            factor_D = params.Dc / (params.eps_R - params.eps_D + 1e-12)
-            D_dot = factor_D * bracket_damage * p_dot
+        # ====================================================================
+        # 6. PLASTIC BRANCH — CORRECTED TWO-PHASE SEQUENCE
+        # ====================================================================
+        def _plastic_update(operand):
+            (
+                eps, eps_old, deps,
+                eps_p_old, eps_e_old, R_old, alpha1_old,
+                lambda_dot_old, eps_p_dot_old, R_dot_old, alpha1_dot_old,
+                sig_trial, n_trial, sigma_eq_trial, fy_trial,
+                dt,
+            ) = operand
 
-       
+            # ── PHASE 1: Advance state using OLD rates ──────────────────────
+            #
+            # These rates were computed at the END of the previous step.
+            # Forward-Euler: Q(t+dt) = Q(t) + Q_dot(t) * dt
 
-            # Flag indicating plastic deformation occurred
+            dlambda      = lambda_dot_old * dt
+            delta_eps_p  = eps_p_dot_old * dt
+
+            eps_p_new    = eps_p_old + delta_eps_p
+            eps_e_new    = eps_e_old + (deps - delta_eps_p)
+            R_new        = R_old + R_dot_old * dt
+            alpha1_new   = alpha1_old + alpha1_dot_old * dt
+            # For two-backstress: alpha2_new = alpha2_old + alpha2_dot_old * dt
+
+            # Recompute stress from the updated plastic strain
+            sig_new      = C @ (eps - eps_p_new)
+            # For damaged models:
+            # D_new = D_old + D_dot_old * dt
+            # sig_new = sig_old + (1.0 - D_new) * (C @ (deps - delta_eps_p))
+
+            # ── PHASE 2: Re-evaluate ALL rates at the NEW state ─────────────
+            #
+            # These become the "old rates" consumed by the NEXT step's Phase 1.
+
+            sig_new_dev    = self._deviatoric(sig_new)
+            n_new          = sig_new_dev - alpha1_new   # subtract all backstresses
+            sigma_eq_new   = self._equivalent_norm(n_new)
+            fy_new         = sigma_eq_new - (params.sigma_y + R_new)
+
+            x              = fy_new / params.eta
+            bracket        = 0.5 * (x + jnp.abs(x))   # McCauley bracket
+            lambda_dot_new = jnp.power(bracket, params.n_visc)
+
+            inv_sigma_eq   = jnp.where(sigma_eq_new > 0.0, 1.0/sigma_eq_new, 0.0)
+            flow_dir       = n_new * inv_sigma_eq
+            eps_p_dot_new  = lambda_dot_new * 1.5 * flow_dir
+
+            R_dot_new      = params.H * lambda_dot_new
+
+            alpha1_dot_new = (
+                (2.0/3.0) * params.C1 * eps_p_dot_new
+                - params.gamma1 * alpha1_new * lambda_dot_new
+            )
+            # For two-backstress:
+            # alpha2_dot_new = (2/3)*C2*eps_p_dot_new - gamma2*alpha2_new*lambda_dot_new
+
+            # Damage rate (if applicable):
+            # sigma_eq_s  = self._equiv_stress(sig_new)
+            # sigma_H_s   = self._hydrostatic(sig_new)
+            # bracket_D   = (2/3)*(1+nu)*sigma_eq_s**2 + 3*(1-2*nu)*sigma_H_s**2
+            # D_dot_new   = (Dc/(eps_R - eps_D + 1e-12)) * bracket_D * lambda_dot_new
+
             is_plastic_out = jnp.array(1.0, dtype=eps.dtype)
 
-            # Return all variables (must match elastic branch signature)
-            return (sig_new, eps_e_new, X_new, eps, eps_p_new,
-                    p_new, D_new, R_new, fy, p_dot, dp, D_dot,
-                    R_dot, X_dot, eps_I_dot, is_plastic_out)
-        
-        # ====================================================================
-        # 7. CONDITIONAL EXECUTION 
-        # ====================================================================
-        
-        # Determine which branch to execute based on yield function
-        is_plastic = fy > 0.0
+            return (
+                sig_new, eps_p_new, eps_e_new, R_new, alpha1_new,
+                lambda_dot_new, dlambda, eps_p_dot_new, R_dot_new, alpha1_dot_new,
+                fy_new, is_plastic_out,
+            )
 
-        # Execute appropriate branch (JAX will compile both)
-        (sig_new, eps_e_new, X_new, eps, eps_p_new, p_new, D_new, R_new, 
-         fy, p_dot, dp, D_dot, R_dot, X_dot, eps_I_dot, is_plastic_out) = jax.lax.cond(
-            is_plastic,
+        # ====================================================================
+        # 7. CONDITIONAL BRANCHING
+        # ====================================================================
+        (
+            sig_new, eps_p_new, eps_e_new, R_new, alpha1_new,
+            lambda_dot_new, dlambda, eps_p_dot_new, R_dot_new, alpha1_dot_new,
+            fy_out, is_plastic_out,
+        ) = jax.lax.cond(
+            fy_trial > 0.0,
             _plastic_update,
             _elastic_update,
             operand,
-        ) 
+        )
 
         # ====================================================================
-        # 8. UPDATE STATE DICTIONARY (Algorithm 1, line 33-41)
+        # 8. UPDATE STATE — integrated variables AND rates
         # ====================================================================
-        
-        # CRITICAL: Update ALL state variables, even if unchanged
-        state["Strain"] = eps
-        state["Stress"] = sig_new
+        state["Strain"]      = eps
+        state["Stress"]      = sig_new
+        state["eps_p"]       = eps_p_new
+        state["eps_e"]       = eps_e_new
+        state["R"]           = jnp.array([R_new])
+        state["alpha1"]      = alpha1_new
 
-        state["eps_p"] = eps_p_new
-        state["eps_e"] = eps_e_new
-        state["X"] = X_new
-        state["eps_I_dot"] = eps_I_dot
+        # Rates (consumed by Phase 1 of the next step)
+        state["lambda_dot"]  = jnp.array([lambda_dot_new])
+        state["dlambda"]     = jnp.array([dlambda])
+        state["eps_p_dot"]   = eps_p_dot_new
+        state["R_dot"]       = jnp.array([R_dot_new])
+        state["alpha1_dot"]  = alpha1_dot_new
 
-        # Scalars must be wrapped in arrays
-        state["p"] = jnp.array([p_new])
-        state["R"] = jnp.array([R_new])
-        state["D"] = jnp.array([D_new])
-        state["fy"] = jnp.array([fy])
-        state["p_dot"] = jnp.array([p_dot])
-        state["dp"] = jnp.array([dp])
-        state["D_dot"] = jnp.array([D_dot])
-        state["R_dot"] = jnp.array([R_dot])
-        state["is_plastic"] = jnp.array([is_plastic_out])
+        # Diagnostics
+        state["fy"]          = jnp.array([fy_out])
+        state["is_plastic"]  = jnp.array([is_plastic_out])
 
         return sig_new, state
 ```
 
+---
+
 ## Key Points
 
-1. **All branches must have same signature**: Both `_elastic_update` and `_plastic_update` must accept the same `operand` tuple and return the same number of values.
+1. **Two-phase plastic update is mandatory**. Phase 1 advances state with old rates. Phase 2 recomputes rates at the new state. Never compute `dlambda` from `fy_trial`.
 
-2. **Update all state variables**: Even if a variable doesn't change, it must be assigned in the state dictionary.
+2. **Rate variables must be in state**. Every `Q_dot` used in Phase 1 must be stored in `internal_state_variables` and updated every step.
 
-3. **Scalar wrapping**: JAX requires consistent shapes. Scalars are stored as length-1 arrays.
+3. **Both branches have identical return signature**. `jax.lax.cond` requires this.
 
-4. **Numerical stability**: Use regularization for square roots, safe division with `jnp.where`, and clipping for physical bounds.
+4. **Update ALL state variables every step**. Even unchanged variables must be assigned.
 
-5. **Pure functions**: The inner update functions must not have side effects or depend on external state.
+5. **Scalar wrapping**. Scalars stored as length-1 arrays: `jnp.array([value])`.
 
-6. **Algorithm correspondence**: Comments reference Algorithm 1 line numbers to maintain traceability to the source paper.
+6. **Elastic stiffness**. Always `self.elastic_model.C`, never recomputed.
+
+7. **Numerical stability**. Use regularized `_equivalent_norm`, safe division with `jnp.where`, clipping for physical bounds.
+
+8. **Pure inner functions**. No side effects; all data passed via `operand`.

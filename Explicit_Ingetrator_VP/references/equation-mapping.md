@@ -2,315 +2,270 @@
 
 This reference shows how to translate common constitutive equations into JAX-compatible Python code for the explicit integration scheme.
 
+## ⚠️ Read First: The Corrected Two-Phase Pattern
+
+All plastic update implementations in this file follow the **corrected explicit sequence**:
+- **Phase 1**: Advance state variables using rates stored from the *previous* step.
+- **Phase 2**: Re-evaluate the yield function and all rates at the *new* state, and store them for the next step.
+
+Never compute the plastic strain increment directly from `fy_trial`. See `code-template.md` for full details.
+
+---
+
 ## Fundamental Equations
 
-### 1. Strain Decomposition 
+### 1. Strain Decomposition
 
 **Equation:**
 ```
-ε̇ = ε̇ᵉ + ε̇ᴵ
+ε = εe + εp
 ```
 
-**Code (forward Euler):**
+**Code (inside `_plastic_update`, Phase 1):**
 ```python
-# At time step t:
-eps = eps_e + eps_p  # Total = elastic + plastic
-
-# During update:
-delta_eps_e = deps - delta_eps_I  # Elastic = total - inelastic
-eps_e_new = eps_e_old + delta_eps_e
-eps_p_new = eps_p_old + delta_eps_I
+# Phase 1: advance using old rates
+delta_eps_p = eps_p_dot_old * dt
+eps_p_new   = eps_p_old + delta_eps_p
+eps_e_new   = eps_e_old + (deps - delta_eps_p)
 ```
 
-### 2. Stress-Strain Law 
+---
+
+### 2. Stress-Strain Law
+
+**Equation (without damage):**
+```
+σ = C : (ε - εp)
+```
+
+**Code (Phase 1, after updating εp):**
+```python
+sig_new = C @ (eps - eps_p_new)
+```
 
 **Equation (with damage):**
 ```
-σ̇ = (1-D) C : ε̇ᵉ = (1-D) C : (ε̇ - ε̇ᴵ)
+σ̇ = (1-D) C : ε̇e
 ```
 
-**Code:**
+**Code (Phase 1, with damage):**
 ```python
-# Elastic predictor (assume elastic)
-sig_trial = sig_old + (1.0 - D_old) * (C @ deps)
-
-# Plastic corrector (if plastic)
-delta_eps_e = deps - delta_eps_I
+D_new   = D_old + D_dot_old * dt
+delta_eps_p = eps_p_dot_old * dt
+delta_eps_e = deps - delta_eps_p
 sig_new = sig_old + (1.0 - D_new) * (C @ delta_eps_e)
 ```
 
-**Alternative (without damage):**
+---
+
+### 3. Elastic Predictor
+
+**Code (before branching — uses OLD εp):**
 ```python
-sig_new = sig_old + C @ (deps - delta_eps_I)
+sig_trial = C @ (eps - eps_p_old)
+# With damage: sig_trial = sig_old + (1.0 - D_old)*(C @ deps)
 ```
 
-### 3. Yield Function 
+---
 
-**Equation (Lemaitre-Chaboche):**
+### 4. Yield Function
+
+**Equation (Chaboche — backstress + hardening, no damage):**
 ```
-f = J₂(σ - X)/(1-D) - (R + k)
+f = J₂(σ - X) - (R + σy)
 ```
 
-**Code:**
+**Code (at trial state, for gate check):**
 ```python
-# Compute effective stress (remove backstress)
-sig_eff = sig_trial - X_old
-sig_eff_dev = self._deviatoric(sig_eff)
-J2_eff = self._J2(sig_eff_dev)
-
-# Account for damage
-denom_D = 1.0 - D_old
-sigma_eff = J2_eff / denom_D
-
-# Yield function
-fy = sigma_eff - (R_old + params.k)
-
-# Check: fy > 0 means plastic, fy <= 0 means elastic
-is_plastic = fy > 0.0
+sig_trial_dev  = self._deviatoric(sig_trial)
+n_trial        = sig_trial_dev - alpha1_old  # subtract all backstresses
+sigma_eq_trial = self._equivalent_norm(n_trial)
+fy_trial       = sigma_eq_trial - (params.sigma_y + R_old)
 ```
 
-**von Mises (no backstress, no damage):**
+**Code (Phase 2 — at new state):**
 ```python
-sig_dev = self._deviatoric(sig_trial)
-J2 = self._J2(sig_dev)
-fy = J2 - (R_old + params.k)
+sig_new_dev  = self._deviatoric(sig_new)
+n_new        = sig_new_dev - alpha1_new    # subtract updated backstresses
+sigma_eq_new = self._equivalent_norm(n_new)
+fy_new       = sigma_eq_new - (params.sigma_y + R_new)
 ```
 
-### 4. Flow Rule 
-
-**Equation (associative plasticity):**
-```
-ε̇ᴵ = (3/2) ṗ × ∂f/∂σ = (3/2) ṗ × (σ' - X')/J₂(σ - X)
-```
-
-**Code:**
+**With damage (at new state):**
 ```python
-# Compute flow direction (normal to yield surface)
-sig_eff = sig_trial - X_old  # or sig_new - X_new
-sig_eff_dev = self._deviatoric(sig_eff)
-J2_eff = self._J2(sig_eff_dev)
-
-# Safe division
-inv_J2 = jnp.where(J2_eff > 0.0, 1.0 / J2_eff, 0.0)
-flow_dir = sig_eff_dev * inv_J2  # Normalized direction
-
-# Inelastic strain rate
-eps_I_dot = 1.5 * p_dot * flow_dir
-
-# Inelastic strain increment
-delta_eps_I = eps_I_dot * dt
+sigma_eq_new = self._equivalent_norm(n_new) / (1.0 - D_new)
+fy_new       = sigma_eq_new - (params.sigma_y + R_new)
 ```
 
-## Viscoplastic Consistency
+---
 
-### 5. Perzyna Viscoplasticity 
+### 5. Viscoplastic Consistency (Perzyna)
 
 **Equation:**
 ```
-ṗ = 〈[J₂(σ-X)/(1-D) - R - k]/K〉ⁿ
+λ̇ = 〈f/η〉ⁿ
 ```
 
-where `〈x〉 = max(x, 0)` (McCauley bracket)
-
-**Code:**
+**Code (Phase 2 only — evaluated at new state):**
 ```python
-# McCauley bracket implementation
-x = fy / params.K_visc
-bracket = 0.5 * (x + jnp.abs(x))  # = max(x, 0)
-
-# Plastic strain rate
-p_dot = jnp.power(bracket, params.n_visc)
-
-# Plastic strain increment
-dp = p_dot * dt
-p_new = p_old + dp
+x              = fy_new / params.eta
+bracket        = 0.5 * (x + jnp.abs(x))   # McCauley bracket = max(x, 0)
+lambda_dot_new = jnp.power(bracket, params.n_visc)
 ```
 
-**Rate-independent plasticity:**
-For rate-independent plasticity, use very large `n_visc` (e.g., 100) and very small `K_visc` (e.g., 0.01) to approximate the limit.
+**WRONG (never do this — uses trial state):**
+```python
+# WRONG: do not compute lambda_dot from fy_trial
+bracket = 0.5 * (fy_trial/params.eta + jnp.abs(fy_trial/params.eta))
+dlambda = dt * jnp.power(bracket, params.n_visc)  # ← WRONG
+```
+
+---
+
+### 6. Flow Rule
+
+**Equation (associative):**
+```
+ε̇p = λ̇ × (3/2) × (σ' - X') / J₂(σ - X)
+```
+
+**Code (Phase 2 — uses `n_new` and `sigma_eq_new` from Phase 2):**
+```python
+inv_sigma_eq  = jnp.where(sigma_eq_new > 0.0, 1.0/sigma_eq_new, 0.0)
+flow_dir      = n_new * inv_sigma_eq           # normalized flow direction
+eps_p_dot_new = lambda_dot_new * 1.5 * flow_dir
+```
+
+**WRONG (uses trial flow direction):**
+```python
+# WRONG: do not use n_trial as flow direction for the increment
+delta_eps_p = 1.5 * dlambda * n_trial * inv_sigma_eq_trial  # ← WRONG
+```
+
+---
 
 ## Hardening Evolution
 
-### 6. Isotropic Hardening 
+### 7. Isotropic Hardening
+
+**Equation (linear):**
+```
+Ṙ = H λ̇
+```
+
+**Phase 1 (advance R):**
+```python
+R_new = R_old + R_dot_old * dt
+```
+
+**Phase 2 (recompute rate at new state):**
+```python
+R_dot_new = params.H * lambda_dot_new
+```
 
 **Equation (exponential saturation):**
 ```
-Ṙ = b(R₁ - R)ṗ
+Ṙ = b(R₁ - R) λ̇
 ```
 
-**Code:**
+**Phase 1:**
 ```python
-# Rate
-R_dot = params.b * (params.R1 - R_old) * p_dot
-
-# Update (forward Euler)
-R_new = R_old + R_dot * dt
+R_new = R_old + R_dot_old * dt
 ```
 
-**Linear hardening:**
-```
-Ṙ = H ṗ
-```
-
+**Phase 2:**
 ```python
-R_dot = params.H * p_dot
-R_new = R_old + R_dot * dt
+R_dot_new = params.b * (params.R1 - R_new) * lambda_dot_new
 ```
 
-### 7. Kinematic Hardening
+---
 
-**Armstrong-Frederick :**
-```
-Ẋ = (2/3) a ε̇ᴵ - c X ṗ
-```
-
-**Code:**
-```python
-# Rate
-X_dot = (2.0/3.0) * params.a * eps_I_dot - params.c * X_old * p_dot
-
-# Update
-X_new = X_old + X_dot * dt
-```
-
-**Prager (linear kinematic):**
-```
-Ẋ = (2/3) a ε̇ᴵ
-```
-
-```python
-X_dot = (2.0/3.0) * params.a * eps_I_dot
-X_new = X_old + X_dot * dt
-```
-
-**Chaboche (multiple backstresses):**
-```
-Ẋᵢ = (2/3) aᵢ ε̇ᴵ - cᵢ Xᵢ ṗ,  i = 1,2,...,M
-X = Σ Xᵢ
-```
-
-```python
-# Need M backstress tensors in state
-for i in range(M):
-    X_i_dot = (2.0/3.0) * params.a[i] * eps_I_dot - params.c[i] * X_i_old * p_dot
-    X_i_new = X_i_old + X_i_dot * dt
-
-# Total backstress
-X_new = sum(X_i_new for all i)
-```
-
-## Damage Evolution
-
-### 8. Lemaitre Damage 
+### 8. Kinematic Hardening (Armstrong-Frederick)
 
 **Equation:**
 ```
-Ḋ = [Dc/(εR - εD)] × [(2/3)(1+ν)σ²ₑq + 3(1-2ν)σ²ₕ] × ṗ
+α̇ᵢ = (2/3) Cᵢ ε̇p - γᵢ αᵢ λ̇
 ```
 
-**Code:**
+**Phase 1 (advance backstress):**
 ```python
-# Compute equivalent and hydrostatic stress
-sigma_eq = self._equiv_stress(sig_new)  # Huber-Mises
-sigma_H = self._hydrostatic(sig_new)     # Mean normal stress
+alpha1_new = alpha1_old + alpha1_dot_old * dt
+alpha2_new = alpha2_old + alpha2_dot_old * dt   # if two backstresses
+```
 
-# Damage strain energy release rate
-nu = params.nu
-bracket_damage = (
-    (2.0/3.0) * (1.0 + nu) * sigma_eq**2 +
-    3.0 * (1.0 - 2.0*nu) * sigma_H**2
+**Phase 2 (recompute rate at new state):**
+```python
+alpha1_dot_new = (
+    (2.0/3.0) * params.C1 * eps_p_dot_new
+    - params.gamma1 * alpha1_new * lambda_dot_new
 )
-
-# Damage rate
-factor_D = params.Dc / (params.eps_R - params.eps_D + 1e-12)
-D_dot = factor_D * bracket_damage * p_dot
-
-# Update
-D_new = D_old + D_dot * dt
-
-# Enforce physical bounds: D ∈ [0, Dc]
-D_new = jnp.clip(D_new, 0.0, params.Dc)
+alpha2_dot_new = (
+    (2.0/3.0) * params.C2 * eps_p_dot_new
+    - params.gamma2 * alpha2_new * lambda_dot_new
+)
 ```
 
-**Simplified damage (proportional to plastic work):**
+**Note**: `C1` and `C2` can be different (that is correct for two-backstress models). Using the same `C1` for both backstresses is wrong unless the user's equations specify that.
+
+---
+
+## Damage Evolution
+
+### 9. Lemaitre Damage
+
+**Equation:**
 ```
-Ḋ = A σₑq ṗ
+Ḋ = [Dc/(εR - εD)] × [(2/3)(1+ν)σ²eq + 3(1-2ν)σ²H] × λ̇
 ```
 
+**Phase 1 (advance D):**
 ```python
-sigma_eq = self._equiv_stress(sig_new)
-D_dot = params.A * sigma_eq * p_dot
-D_new = jnp.clip(D_old + D_dot * dt, 0.0, params.Dc)
+D_new = jnp.clip(D_old + D_dot_old * dt, 0.0, params.Dc)
 ```
+
+**Phase 2 (recompute damage rate at new state):**
+```python
+sigma_eq_s    = self._equiv_stress(sig_new)
+sigma_H_s     = self._hydrostatic(sig_new)
+nu            = params.nu
+bracket_D     = (
+    (2.0/3.0) * (1.0 + nu) * sigma_eq_s**2
+    + 3.0 * (1.0 - 2.0*nu) * sigma_H_s**2
+)
+factor_D      = params.Dc / (params.eps_R - params.eps_D + 1e-12)
+D_dot_new     = factor_D * bracket_D * lambda_dot_new
+```
+
+---
 
 ## Helper Functions
 
-### J2 Invariant (Huber-Mises Stress)
+### J2 Equivalent Norm
 
-**Definition:**
-```
-J₂ = √(3/2 s:s) = √[(s₁₁² + s₂₂² + s₃₃² + 2s₁₂² + 2s₁₃² + 2s₂₃²) × 3/2]
-```
-
-where s is deviatoric stress.
-
-**Code (with regularization):**
 ```python
-def _J2(self, sig_dev):
-    s = sig_dev
-    
-    # Voigt notation: factor of 2 for shear components
-    s_colon_s = (
-        s[0]**2 + s[1]**2 + s[2]**2 +
-        2.0 * (s[3]**2 + s[4]**2 + s[5]**2)
-    )
-    
-    val = 1.5 * s_colon_s
+def _equivalent_norm(self, vec):
+    """sqrt(3/2 * vec:vec), regularized for gradients."""
+    val     = 1.5 * self._norm_voigt(vec)
     val_pos = jnp.maximum(val, 0.0)
-    
-    # Physical value
-    J2_phys = jnp.sqrt(val_pos)
-    
-    # Regularized for gradient (avoid sqrt(0))
     eps_reg = 1e-16
-    J2_reg = jnp.sqrt(val_pos + eps_reg)
-    
-    # Return physical value with regularized gradient
-    return jax.lax.stop_gradient(J2_phys - J2_reg) + J2_reg
+    phys    = jnp.sqrt(val_pos)
+    reg     = jnp.sqrt(val_pos + eps_reg)
+    return jax.lax.stop_gradient(phys - reg) + reg
 ```
 
-### Deviatoric Stress
+### Deviatoric Stress (Voigt)
 
-**Definition:**
-```
-s = σ - (1/3)tr(σ)I
-```
-
-**Code:**
 ```python
 def _deviatoric(self, sig):
-    # Mean normal stress
     p = (sig[0] + sig[1] + sig[2]) / 3.0
-    
-    # Deviatoric components (Voigt)
     return jnp.array([
-        sig[0] - p,
-        sig[1] - p,
-        sig[2] - p,
-        sig[3],      # Shear components unchanged
-        sig[4],
-        sig[5],
+        sig[0]-p, sig[1]-p, sig[2]-p,
+        sig[3], sig[4], sig[5],
     ], dtype=sig.dtype)
 ```
 
 ### Hydrostatic Stress
 
-**Definition:**
-```
-σₕ = (1/3)tr(σ) = (σ₁₁ + σ₂₂ + σ₃₃)/3
-```
-
-**Code:**
 ```python
 def _hydrostatic(self, sig):
     return (sig[0] + sig[1] + sig[2]) / 3.0
@@ -318,106 +273,81 @@ def _hydrostatic(self, sig):
 
 ### Equivalent (von Mises) Stress
 
-**Definition:**
-```
-σₑq = √(3 J₂)
-```
-
-**Code:**
 ```python
 def _equiv_stress(self, sig):
-    sig_dev = self._deviatoric(sig)
-    return self._J2(sig_dev)  # Already includes √(3/2 s:s)
+    return self._equivalent_norm(self._deviatoric(sig))
 ```
+
+---
 
 ## Equation Patterns
 
-### Pattern 1: Rate-Dependent Evolution
+### Pattern 1: Two-Phase for Any Rate Variable
 
-For any variable Q evolving as Q̇ = f(Q, p, ...)ṗ:
+For any `Q̇ = f(Q, λ̇, ε̇p, ...)`:
 
+**Phase 1** (inside `_plastic_update`):
 ```python
-# In _plastic_update:
+Q_new = Q_old + Q_dot_old * dt
+```
 
-Q_new = Q_old + Q_dot * dt
-Q_dot = f(Q_old, p_old, ...) * p_dot
+**Phase 2** (after computing `sig_new`, `lambda_dot_new`, `eps_p_dot_new`):
+```python
+Q_dot_new = f(Q_new, lambda_dot_new, eps_p_dot_new, ...)
+```
+
+**State storage** (outside both branches):
+```python
+state["Q"]     = jnp.array([Q_new])
+state["Q_dot"] = jnp.array([Q_dot_new])
 ```
 
 ### Pattern 2: Saturation-Type Evolution
 
-For Q̇ = a(Q∞ - Q)ṗ:
+`Q̇ = a(Q∞ - Q) λ̇`
 
 ```python
-
-Q_new = Q_old + Q_dot * dt
-Q_dot = params.a * (params.Q_inf - Q_old) * p_dot
+# Phase 1
+Q_new = Q_old + Q_dot_old * dt
+# Phase 2
+Q_dot_new = params.a * (params.Q_inf - Q_new) * lambda_dot_new
 ```
 
-### Pattern 3: Recovery-Type Evolution
+### Pattern 3: Recovery-Type (Armstrong-Frederick)
 
-For Q̇ = a ε̇ᴵ - b Q ṗ:
+`Q̇ = a ε̇p - b Q λ̇`
 
 ```python
-Q_new = Q_old + Q_dot * dt
-Q_dot = params.a * eps_I_dot - params.b * Q_old * p_dot
-
+# Phase 1
+Q_new = Q_old + Q_dot_old * dt
+# Phase 2
+Q_dot_new = params.a * eps_p_dot_new - params.b * Q_new * lambda_dot_new
 ```
 
-### Pattern 4: Stress-Driven Evolution
-
-For Q̇ = g(σ) ṗ:
-
-```python
-# Compute stress-dependent term
-g_sigma = compute_stress_function(sig_new, params)
-
-# Evolution
-Q_dot = g_sigma * p_dot
-Q_new = Q_old + Q_dot * dt
-```
+---
 
 ## Common Model Combinations
 
-### Model 1: J2 Plasticity (von Mises)
+### Model 1: Single-Backstress Viscoplastic (Chaboche)
 
-- Yield: f = J₂(σ) - (R + k)
-- Flow: ε̇ᴵ = (3/2) ṗ σ'/J₂
-- Hardening: Ṙ = H ṗ
-- No damage, no backstress
+| Equation               | Phase 1 advances  | Phase 2 recomputes      |
+|------------------------|-------------------|-------------------------|
+| Strain decomp.         | εp, εe            | —                       |
+| Stress                 | σ                 | —                       |
+| Yield + viscoplastic   | —                 | f, λ̇, ε̇p              |
+| Isotropic hardening    | R                 | Ṙ                       |
+| Kinematic hardening    | α                 | α̇                       |
 
-### Model 2: Perzyna Viscoplasticity
+### Model 2: Two-Backstress Viscoplastic
 
-- Yield: f = J₂(σ) - (R + k)
-- Rate: ṗ = 〈f/K〉ⁿ
-- Flow: ε̇ᴵ = (3/2) ṗ σ'/J₂
-- Hardening: Ṙ = b(R₁ - R)ṗ
+Same as Model 1, with `alpha1`, `alpha2` each having their own rate (`C1,γ1` and `C2,γ2`).
 
-### Model 3: Chaboche Model
+### Model 3: Lemaitre-Chaboche (with damage)
 
-- Yield: f = J₂(σ - X) - (R + k)
-- Rate: ṗ = 〈f/K〉ⁿ
-- Flow: ε̇ᴵ = (3/2) ṗ (σ' - X')/J₂(σ - X)
-- Isotropic: Ṙ = b(R₁ - R)ṗ
-- Kinematic: Ẋ = (2/3)a ε̇ᴵ - c X ṗ
+Adds `D` (advanced in Phase 1) and `D_dot` (recomputed in Phase 2). Stress update uses `(1-D_new)`.
 
-### Model 4: Lemaitre-Chaboche (Full)
+---
 
-- All from Model 3, plus:
-- Damage in yield: f = J₂(σ - X)/(1-D) - (R + k)
-- Damage evolution: Ḋ = [Dc/(εR-εD)] × Y × ṗ
-- Stress update: σ̇ = (1-D) C : ε̇ᵉ
+## Time Integration Note
 
-## Time Integration
-
-All equations use **forward Euler** (explicit):
-
-```
-Q(t+Δt) = Q(t) + Q̇(t) × Δt
-```
-
-For better accuracy with larger time steps, consider:
-- **Backward Euler** (implicit, requires iteration)
-- **Midpoint rule** (semi-implicit)
-- **Runge-Kutta methods** (multi-stage explicit)
-
-The current template uses forward Euler for simplicity and compatibility with JAX's automatic differentiation.
+All equations use **forward Euler** (explicit). The corrected two-phase sequence ensures that the rates consumed in Phase 1 were accurately computed at the *state at the end of the previous step*, making it a proper explicit scheme.
