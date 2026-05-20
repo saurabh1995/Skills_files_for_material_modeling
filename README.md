@@ -176,7 +176,7 @@ The plugin metadata is stored in `.claude-plugin/plugin.json`:
   "description": "Unified plugin containing explicit/implicit constitutive integration skills for FEniCSx.",
   "version": "1.0.0",
   "author": {
-    "name": "Ameya"
+    "name": "Saurabh, Ameya"
   }
 }
 ```
@@ -191,3 +191,6 @@ Dr.-Ing Saurabh Tandale is a PostDoc at Institute of general Mechanics, RWTH Aac
 
 Email : tandale@iam.rwth-aachen.de 
 
+## Other Contributors 
+
+Ameya Mahamuni (RWTH Aachen University, ameya.mahamuni@rwth-aachen.de)
